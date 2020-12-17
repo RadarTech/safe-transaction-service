@@ -186,6 +186,7 @@ class MultisigConfirmationAdmin(admin.ModelAdmin):
                     'signature_type', 'owner')
     list_filter = (MultisigConfirmationListFilter, 'signature_type')
     list_select_related = ('ethereum_tx',)
+    ordering = ['-created']
     raw_id_fields = ('ethereum_tx', 'multisig_transaction')
     search_fields = ['=multisig_transaction__safe', '=ethereum_tx__tx_hash', '=multisig_transaction_hash', '=owner']
 
@@ -247,7 +248,7 @@ class ModuleTransactionAdmin(admin.ModelAdmin):
     search_fields = ['safe', 'module', 'to']
 
     def data_hex(self, o: ModuleTransaction):
-        return HexBytes(o.data.tobytes()).hex()
+        return HexBytes(o.data.tobytes()).hex() if o.data else None
 
     def tx_hash(self, o: ModuleTransaction):
         return o.internal_tx.ethereum_tx_id

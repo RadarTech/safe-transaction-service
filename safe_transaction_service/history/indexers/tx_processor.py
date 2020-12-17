@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from logging import getLogger
-from typing import Dict, List, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 from django.db import transaction
 
@@ -8,6 +8,7 @@ from eth_utils import event_abi_to_log_topic
 from hexbytes import HexBytes
 from web3 import Web3
 
+from gnosis.eth import EthereumClient
 from gnosis.eth.constants import NULL_ADDRESS
 from gnosis.eth.contracts import get_safe_contract, get_safe_V1_0_0_contract
 from gnosis.safe import SafeTx
@@ -18,6 +19,27 @@ from ..models import (EthereumTx, InternalTx, InternalTxDecoded,
                       MultisigTransaction, SafeContract, SafeStatus)
 
 logger = getLogger(__name__)
+
+
+class TxProcessorException(Exception):
+    pass
+
+
+class OwnerCannotBeRemoved(TxProcessorException):
+    pass
+
+
+class SafeTxProcessorProvider:
+    def __new__(cls):
+        if not hasattr(cls, 'instance'):
+            from django.conf import settings
+            cls.instance = SafeTxProcessor(EthereumClient(settings.ETHEREUM_TRACING_NODE_URL))
+        return cls.instance
+
+    @classmethod
+    def del_singleton(cls):
+        if hasattr(cls, 'instance'):
+            del cls.instance
 
 
 class TxProcessor(ABC):
@@ -34,8 +56,9 @@ class SafeTxProcessor(TxProcessor):
     Processor for txs on Safe Contracts v0.0.1 - v1.0.0
     """
 
-    def __init__(self):
+    def __init__(self, ethereum_client: EthereumClient):
         # This safe_tx_failure events allow us to detect a failed safe transaction
+        self.ethereum_client = ethereum_client
         dummy_w3 = Web3()
         self.safe_tx_failure_events = [
             get_safe_V1_0_0_contract(dummy_w3).events.ExecutionFailed(),
@@ -52,6 +75,13 @@ class SafeTxProcessor(TxProcessor):
             event_abi_to_log_topic(event.abi) for event in self.safe_tx_module_failure_events
         }
         self.safe_status_cache: Dict[str, SafeStatus] = {}
+
+    def clear_cache(self, safe_address: Optional[str] = None):
+        if safe_address:
+            if safe_address in self.safe_status_cache:
+                del self.safe_status_cache[safe_address]
+        else:
+            self.safe_status_cache.clear()
 
     def is_failed(self, ethereum_tx: EthereumTx, safe_tx_hash: Union[str, bytes]) -> bool:
         """
@@ -87,7 +117,26 @@ class SafeTxProcessor(TxProcessor):
         return False
 
     def get_last_safe_status_for_address(self, address: str) -> SafeStatus:
-        return self.safe_status_cache.get(address) or SafeStatus.objects.last_for_address(address)
+        safe_status = self.safe_status_cache.get(address) or SafeStatus.objects.last_for_address(address)
+        if not safe_status:
+            logger.error('SafeStatus not found for address=%s', address)
+        return safe_status
+
+    def remove_owner(self, internal_tx: InternalTx, safe_status: SafeStatus, owner: str):
+        """
+        :param internal_tx:
+        :param safe_status:
+        :param owner:
+        :return:
+        """
+        contract_address = internal_tx._from
+        try:
+            safe_status.owners.remove(owner)
+            MultisigConfirmation.objects.remove_unused_confirmations(contract_address, safe_status.nonce, owner)
+        except ValueError as e:
+            logger.error('Error processing trace=%s for contract=%s with tx-hash=%s. Cannot remove owner=%s',
+                         internal_tx.trace_address, contract_address, internal_tx.ethereum_tx_id, owner)
+            raise OwnerCannotBeRemoved() from e
 
     def store_new_safe_status(self, safe_status: SafeStatus, internal_tx: InternalTx) -> SafeStatus:
         safe_status.store_new(internal_tx)
@@ -159,28 +208,23 @@ class SafeTxProcessor(TxProcessor):
             SafeStatus.objects.create(internal_tx=internal_tx,
                                       address=contract_address, owners=owners, threshold=threshold,
                                       nonce=nonce, master_copy=master_copy, fallback_handler=fallback_handler)
+            self.clear_cache(contract_address)
         elif function_name in ('addOwnerWithThreshold', 'removeOwner', 'removeOwnerWithThreshold'):
             logger.debug('Processing owner/threshold modification')
             safe_status = self.get_last_safe_status_for_address(contract_address)
             safe_status.threshold = arguments['_threshold']
             owner = arguments['owner']
-            try:
-                if function_name == 'addOwnerWithThreshold':
-                    safe_status.owners.append(owner)
-                else:  # removeOwner, removeOwnerWithThreshold
-                    safe_status.owners.remove(owner)
-                    MultisigConfirmation.objects.remove_unused_confirmations(contract_address, safe_status.nonce, owner)
-            except ValueError:
-                logger.error('Error processing trace=%s for contract=%s with tx-hash=%s',
-                             internal_tx.trace_address, contract_address,
-                             internal_tx.ethereum_tx_id)
+            if function_name == 'addOwnerWithThreshold':
+                safe_status.owners.append(owner)
+            else:  # removeOwner, removeOwnerWithThreshold
+                self.remove_owner(internal_tx, safe_status, owner)
             self.store_new_safe_status(safe_status, internal_tx)
         elif function_name == 'swapOwner':
             logger.debug('Processing owner swap')
             old_owner = arguments['oldOwner']
             new_owner = arguments['newOwner']
             safe_status = self.get_last_safe_status_for_address(contract_address)
-            safe_status.owners.remove(old_owner)
+            self.remove_owner(internal_tx, safe_status, old_owner)
             safe_status.owners.append(new_owner)
             self.store_new_safe_status(safe_status, internal_tx)
         elif function_name == 'changeThreshold':
@@ -211,8 +255,20 @@ class SafeTxProcessor(TxProcessor):
             self.store_new_safe_status(safe_status, internal_tx)
         elif function_name == 'execTransactionFromModule':
             logger.debug('Executing Tx from Module')
+            # TODO Add test with previous traces for processing a module transaction
             ethereum_tx = internal_tx.ethereum_tx
-            module_internal_tx = internal_tx.get_previous_module_trace()
+            # Someone calls Module -> Module calls Safe Proxy -> Safe Proxy delegate calls Master Copy
+            # The trace that is been processed is the last one, so indexer needs to go at least 2 traces back
+            previous_trace = self.ethereum_client.parity.get_previous_trace(internal_tx.ethereum_tx_id,
+                                                                            internal_tx.trace_address_as_list,
+                                                                            number_traces=2,
+                                                                            skip_delegate_calls=True)
+            if not previous_trace:
+                message = f'Cannot find previous trace for tx-hash={HexBytes(internal_tx.ethereum_tx_id).hex()} and ' \
+                          f'trace-address={internal_tx.trace_address}'
+                logger.warning(message)
+                raise ValueError(message)
+            module_internal_tx = InternalTx.objects.build_from_trace(previous_trace, internal_tx.ethereum_tx)
             module_address = module_internal_tx.to if module_internal_tx else NULL_ADDRESS
             module_data = HexBytes(arguments['data'])
             failed = self.is_module_failed(ethereum_tx, module_address)
@@ -234,13 +290,22 @@ class SafeTxProcessor(TxProcessor):
             logger.debug('Processing hash approval')
             multisig_transaction_hash = arguments['hashToApprove']
             ethereum_tx = internal_tx.ethereum_tx
-            # TODO Check previous trace is not a delegate call
-            owner = internal_tx.get_previous_trace()._from
+            previous_trace = self.ethereum_client.parity.get_previous_trace(internal_tx.ethereum_tx_id,
+                                                                            internal_tx.trace_address_as_list,
+                                                                            skip_delegate_calls=True)
+            if not previous_trace:
+                message = f'Cannot find previous trace for tx-hash={HexBytes(internal_tx.ethereum_tx_id).hex()} and ' \
+                          f'trace-address={internal_tx.trace_address}'
+                logger.warning(message)
+                raise ValueError(message)
+            previous_internal_tx = InternalTx.objects.build_from_trace(previous_trace, internal_tx.ethereum_tx)
+            owner = previous_internal_tx._from
             safe_signature = SafeSignatureApprovedHash.build_for_owner(owner, multisig_transaction_hash)
             (multisig_confirmation,
              _) = MultisigConfirmation.objects.get_or_create(multisig_transaction_hash=multisig_transaction_hash,
                                                              owner=owner,
                                                              defaults={
+                                                                 'created': internal_tx.ethereum_tx.block.timestamp,
                                                                  'ethereum_tx': ethereum_tx,
                                                                  'signature': safe_signature.export_signature(),
                                                                  'signature_type': safe_signature.signature_type.value,
@@ -316,6 +381,7 @@ class SafeTxProcessor(TxProcessor):
                     multisig_transaction_hash=safe_tx_hash,
                     owner=safe_signature.owner,
                     defaults={
+                        'created': internal_tx.ethereum_tx.block.timestamp,
                         'ethereum_tx': None,
                         'multisig_transaction': multisig_tx,
                         'signature': safe_signature.export_signature(),

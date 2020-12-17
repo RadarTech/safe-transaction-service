@@ -1,5 +1,6 @@
 from django.urls import path
 
+from safe_transaction_service.contracts import views as contract_views
 from safe_transaction_service.notifications import views as notification_views
 from safe_transaction_service.tokens import views as token_views
 
@@ -13,6 +14,10 @@ urlpatterns = [
     path('about/', views.AboutView.as_view(), name='about'),
     path('about/master-copies/', views.MasterCopiesView.as_view(),
          name='master-copies'),
+    path('analytics/multisig-transactions/by-safe/', views.AnalyticsMultisigTxsBySafeListView.as_view(),
+         name='analytics-multisig-txs-by-safe'),
+    path('analytics/multisig-transactions/by-origin/', views.AnalyticsMultisigTxsByOriginListView.as_view(),
+         name='analytics-multisig-txs-by-origin'),
     path('safes/<str:address>/', views.SafeInfoView.as_view(),
          name='safe-info'),
     path('safes/<str:address>/transactions/', views.SafeMultisigTransactionListView.as_view(),
@@ -41,8 +46,6 @@ urlpatterns = [
          name='safe-delegates'),
     path('safes/<str:address>/delegates/<str:delegate_address>/', views.SafeDelegateDestroyView.as_view(),
          name='safe-delegate'),
-    path('multisig-transactions/analytics/', views.SafeMultisigTransactionAnalyticsListView.as_view(),
-         name='multisig-transactions-analytics'),  # Order matters
     path('transactions/<str:safe_tx_hash>/', views.SafeMultisigTransactionDetailView.as_view(),
          name='multisig-transaction'),  # DEPRECATED, use `multisig-transactions/`
     path('multisig-transactions/<str:safe_tx_hash>/', views.SafeMultisigTransactionDetailView.as_view(),
@@ -51,6 +54,10 @@ urlpatterns = [
          name='multisig-transaction-confirmations'),
     path('owners/<str:address>/', views.OwnersView.as_view(),
          name='owners'),
+
+    # Contracts
+    path('contracts/', contract_views.ContractsView.as_view(), name='contracts'),
+    path('contracts/<str:address>/', contract_views.ContractView.as_view(), name='contract'),
 
     # Tokens
     path('tokens/', token_views.TokensView.as_view(), name='tokens'),

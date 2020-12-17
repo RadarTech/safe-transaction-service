@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from typing import Any, Dict, Optional, Type, Union
 
 from django.db.models import Model
@@ -62,7 +63,6 @@ def bind_confirmation(sender: Type[Model],
 def build_webhook_payload(sender: Type[Model],
                           instance: Union[EthereumEvent, InternalTx, MultisigConfirmation, MultisigTransaction]
                           ) -> Optional[Dict[str, Any]]:
-
     payload: Optional[Dict[str, Any]] = None
     if sender == MultisigConfirmation and instance.multisig_transaction_id:
         payload = {
@@ -104,6 +104,29 @@ def build_webhook_payload(sender: Type[Model],
     return payload
 
 
+def is_valid_webhook(sender: Type[Model],
+                     instance: Union[EthereumEvent, InternalTx, MultisigConfirmation, MultisigTransaction],
+                     created: bool, minutes: int = 10) -> bool:
+    """
+    For `MultisigTransaction`, webhook is valid if the instance was modified in the last `minutes` minutes.
+    For the other instances, webhook is valid if the instance was created in the last `minutes` minutes.
+    This time restriction is important to prevent sending duplicate transactions when reindexing.
+    :param sender:
+    :param instance:
+    :param created:
+    :param minutes: Minutes to allow a old notification
+    :return: `True` if webhook is valid, `False` otherwise
+    """
+    if sender == MultisigTransaction:  # Different logic, as `MultisigTransaction` can change from Pending to Executed
+        if instance.modified + timedelta(minutes=minutes) < timezone.now():
+            return False
+    elif not created:
+        return False
+    elif instance.created + timedelta(minutes=minutes) < timezone.now():
+        return False
+    return True
+
+
 @receiver(post_save, sender=MultisigConfirmation, dispatch_uid='multisig_confirmation.process_webhook')
 @receiver(post_save, sender=MultisigTransaction, dispatch_uid='multisig_transaction.process_webhook')
 @receiver(post_save, sender=EthereumEvent, dispatch_uid='ethereum_event.process_webhook')
@@ -111,11 +134,10 @@ def build_webhook_payload(sender: Type[Model],
 def process_webhook(sender: Type[Model],
                     instance: Union[EthereumEvent, InternalTx, MultisigConfirmation, MultisigTransaction],
                     created: bool, **kwargs) -> None:
-
-    if not created and sender != MultisigTransaction:  # MultisigTransaction can change from Pending to Executed
-        return
-
-    payload = build_webhook_payload(sender, instance)
-    if payload and (address := payload.get('address')):
-        send_webhook_task.delay(address, payload)
-        send_notification_task.apply_async(args=(address, payload), countdown=2)
+    if is_valid_webhook(sender, instance, created):
+        # Don't send information for older than 10 minutes transactions
+        # This triggers a DB query on EthereumEvent, InternalTx (they are not TimeStampedModel)
+        payload = build_webhook_payload(sender, instance)
+        if payload and (address := payload.get('address')):
+            send_webhook_task.delay(address, payload)
+            send_notification_task.apply_async(args=(address, payload), countdown=2)

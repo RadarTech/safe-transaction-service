@@ -1,6 +1,7 @@
 import logging
 
 from django.db import IntegrityError
+from django.db.models import QuerySet
 from django.test import TestCase
 
 from eth_account import Account
@@ -8,15 +9,17 @@ from web3 import Web3
 
 from gnosis.safe.safe_signature import SafeSignatureType
 
+from ...contracts.tests.factories import ContractFactory
 from ..models import (EthereumEvent, EthereumTxCallType, InternalTx,
                       InternalTxDecoded, MultisigConfirmation,
                       MultisigTransaction, SafeContractDelegate,
                       SafeMasterCopy, SafeStatus)
 from .factories import (EthereumBlockFactory, EthereumEventFactory,
-                        EthereumTxFactory, InternalTxFactory,
-                        MultisigConfirmationFactory,
+                        EthereumTxFactory, InternalTxDecodedFactory,
+                        InternalTxFactory, MultisigConfirmationFactory,
                         MultisigTransactionFactory,
-                        SafeContractDelegateFactory, SafeStatusFactory)
+                        SafeContractDelegateFactory, SafeContractFactory,
+                        SafeStatusFactory)
 
 logger = logging.getLogger(__name__)
 
@@ -199,21 +202,12 @@ class TestInternalTx(TestCase):
 
     def test_internal_tx_can_be_decoded(self):
         trace_address = '0,0,20,0'
-        trace_address_parent = '0,0,20'
         internal_tx = InternalTxFactory(call_type=EthereumTxCallType.DELEGATE_CALL.value, trace_address=trace_address,
                                         error=None, data=b'123', ethereum_tx__status=1)
-        self.assertFalse(internal_tx.parent_is_errored())
         self.assertTrue(internal_tx.can_be_decoded)
 
-        parent_internal_tx = InternalTxFactory(trace_address=trace_address_parent, error='Reverted',
-                                               ethereum_tx=internal_tx.ethereum_tx)
-        self.assertTrue(internal_tx.parent_is_errored())
+        internal_tx.ethereum_tx.status = 0
         self.assertFalse(internal_tx.can_be_decoded)
-
-        parent_internal_tx.error = None
-        parent_internal_tx.save(update_fields=['error'])
-        self.assertFalse(internal_tx.parent_is_errored())
-        self.assertTrue(internal_tx.can_be_decoded)
 
     def test_internal_txs_can_be_decoded(self):
         InternalTxFactory(call_type=EthereumTxCallType.CALL.value)
@@ -238,24 +232,6 @@ class TestInternalTx(TestCase):
         InternalTxDecoded.objects.create(function_name='alo', arguments={}, internal_tx=internal_tx)
         self.assertEqual(InternalTx.objects.can_be_decoded().count(), 0)
 
-    def test_internal_txs_parent(self):
-        # Test parent trace errored
-        trace_address = '0,0,20,0'
-        trace_address_parent = '0,0,20'
-        another_trace = '0,1'
-        internal_tx = InternalTxFactory(call_type=EthereumTxCallType.DELEGATE_CALL.value, trace_address=trace_address,
-                                        error=None, data=b'123', ethereum_tx__status=1)
-        self.assertEqual(InternalTx.objects.can_be_decoded().count(), 1)
-        not_a_parent_internal_tx = InternalTxFactory(trace_address=another_trace, error='Reverted',
-                                                     ethereum_tx=internal_tx.ethereum_tx)
-        self.assertEqual(InternalTx.objects.can_be_decoded().count(), 1)
-        parent_internal_tx = InternalTxFactory(trace_address=trace_address_parent, error='Reverted',
-                                               ethereum_tx=internal_tx.ethereum_tx)
-        self.assertEqual(InternalTx.objects.can_be_decoded().count(), 0)
-        parent_internal_tx.error = None
-        parent_internal_tx.save(update_fields=['error'])
-        self.assertEqual(InternalTx.objects.can_be_decoded().count(), 1)
-
     def test_internal_txs_bulk(self):
         """
         This is the same for every bulk_insert
@@ -275,6 +251,28 @@ class TestInternalTx(TestCase):
             InternalTx.objects.bulk_create(internal_txs)  # Cannot bulk create again first 2 transactions
 
 
+class TestInternalTxDecoded(TestCase):
+    def test_safes_pending_to_be_processed(self):
+        self.assertCountEqual(InternalTxDecoded.objects.safes_pending_to_be_processed(), [])
+
+        safe_address_1 = SafeContractFactory().address
+        internal_tx_decoded_1 = InternalTxDecodedFactory(internal_tx___from=safe_address_1)
+        InternalTxDecodedFactory(internal_tx___from=safe_address_1)
+        results = InternalTxDecoded.objects.safes_pending_to_be_processed()
+        self.assertIsInstance(results, QuerySet)
+        self.assertCountEqual(results, [safe_address_1])
+
+        safe_address_2 = SafeContractFactory().address
+        internal_tx_decoded_2 = InternalTxDecodedFactory(internal_tx___from=safe_address_2)
+        self.assertCountEqual(InternalTxDecoded.objects.safes_pending_to_be_processed(),
+                              [safe_address_1, safe_address_2])
+
+        # Safes with all processed internal txs decoded are not returned
+        internal_tx_decoded_1.set_processed()
+        internal_tx_decoded_2.set_processed()
+        self.assertCountEqual(InternalTxDecoded.objects.safes_pending_to_be_processed(), [safe_address_1])
+
+
 class TestSafeStatus(TestCase):
     def test_safe_status_store_new(self):
         safe_status = SafeStatusFactory()
@@ -282,6 +280,27 @@ class TestSafeStatus(TestCase):
         internal_tx = InternalTxFactory()
         safe_status.store_new(internal_tx)
         self.assertEqual(SafeStatus.objects.all().count(), 2)
+
+    def test_safe_status_is_corrupted(self):
+        address = Account.create().address
+        safe_status = SafeStatusFactory(nonce=0, address=address)
+        self.assertFalse(safe_status.is_corrupted())
+        safe_status_2 = SafeStatusFactory(nonce=1, address=address)
+        self.assertFalse(safe_status_2.is_corrupted())
+        safe_status_3 = SafeStatusFactory(nonce=2, address=address)
+        self.assertEqual(SafeStatus.objects.count(), 3)
+        safe_status_2.delete()
+        self.assertEqual(SafeStatus.objects.count(), 2)
+        # First SafeStatus is ok, as it has no previous SafeStatus missing
+        self.assertFalse(safe_status.is_corrupted())
+        self.assertTrue(safe_status_3.is_corrupted())
+
+        SafeStatus.objects.all().delete()
+        SafeStatusFactory(nonce=0, address=address)
+        SafeStatusFactory(nonce=1, address=address)
+        SafeStatusFactory(nonce=1, address=address)
+        another_safe_status = SafeStatusFactory(nonce=2, address=address)
+        self.assertFalse(another_safe_status.is_corrupted())
 
     def test_safe_status_last_for_address(self):
         address = Account.create().address
@@ -376,6 +395,87 @@ class TestMultisigTransactions(TestCase):
 
         MultisigTransactionFactory(safe=safe_address, nonce=13)
         self.assertEqual(MultisigTransaction.objects.last_nonce(safe_address), 25)
+
+    def test_safes_with_number_of_transactions_executed(self):
+        self.assertEqual(MultisigTransaction.objects.safes_with_number_of_transactions_executed().count(), 0)
+        safe_address_1 = Account.create().address
+        safe_address_2 = Account.create().address
+        safe_address_3 = Account.create().address
+        MultisigTransactionFactory(safe=safe_address_1)
+        MultisigTransactionFactory(safe=safe_address_1)
+        safes_with_number_of_transactions = MultisigTransaction.objects.safes_with_number_of_transactions_executed()
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], {'safe': safe_address_1, 'transactions': 2})
+        MultisigTransactionFactory(safe=safe_address_1)
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed()
+        self.assertEqual(result[0], {'safe': safe_address_1, 'transactions': 3})
+        MultisigTransactionFactory(safe=safe_address_2)
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed()
+        self.assertEqual(list(result), [
+            {'safe': safe_address_1, 'transactions': 3},
+            {'safe': safe_address_2, 'transactions': 1},
+        ])
+        [MultisigTransactionFactory(safe=safe_address_3) for _ in range(4)]
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed()
+        self.assertEqual(list(result), [
+            {'safe': safe_address_3, 'transactions': 4},
+            {'safe': safe_address_1, 'transactions': 3},
+            {'safe': safe_address_2, 'transactions': 1},
+        ])
+
+    def test_safes_with_number_of_transactions_executed_and_master_copy(self):
+        self.assertEqual(
+            MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy().count(), 0)
+        safe_address_1 = Account.create().address
+        safe_address_2 = Account.create().address
+        safe_address_3 = Account.create().address
+        MultisigTransactionFactory(safe=safe_address_1)
+        MultisigTransactionFactory(safe=safe_address_1)
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], {'safe': safe_address_1, 'transactions': 2, 'master_copy': None})
+        MultisigTransactionFactory(safe=safe_address_2)
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
+        self.assertEqual(list(result), [
+            {'safe': safe_address_1, 'transactions': 2, 'master_copy': None},
+            {'safe': safe_address_2, 'transactions': 1, 'master_copy': None},
+        ])
+
+        safe_status_1 = SafeStatusFactory(address=safe_address_1)
+        self.assertIsNotNone(safe_status_1.master_copy)
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
+        self.assertEqual(list(result), [
+            {'safe': safe_address_1, 'transactions': 2, 'master_copy': safe_status_1.master_copy},
+            {'safe': safe_address_2, 'transactions': 1, 'master_copy': None},
+        ])
+
+        safe_status_2 = SafeStatusFactory(address=safe_address_2)
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
+        self.assertEqual(list(result), [
+            {'safe': safe_address_1, 'transactions': 2, 'master_copy': safe_status_1.master_copy},
+            {'safe': safe_address_2, 'transactions': 1, 'master_copy': safe_status_2.master_copy},
+        ])
+
+        [MultisigTransactionFactory(safe=safe_address_3) for _ in range(4)]
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
+        self.assertEqual(list(result), [
+            {'safe': safe_address_3, 'transactions': 4, 'master_copy': None},
+            {'safe': safe_address_1, 'transactions': 2, 'master_copy': safe_status_1.master_copy},
+            {'safe': safe_address_2, 'transactions': 1, 'master_copy': safe_status_2.master_copy},
+        ])
+
+    def test_not_indexed_metadata_contract_addresses(self):
+        self.assertFalse(MultisigTransaction.objects.not_indexed_metadata_contract_addresses())
+
+        MultisigTransactionFactory(data=None)
+        self.assertFalse(MultisigTransaction.objects.not_indexed_metadata_contract_addresses())
+        multisig_transaction = MultisigTransactionFactory(data=b'12')
+        MultisigTransactionFactory(data=b'12', to=multisig_transaction.to)  # Check distinct
+        self.assertCountEqual(MultisigTransaction.objects.not_indexed_metadata_contract_addresses(),
+                              [multisig_transaction.to])
+        ContractFactory(address=multisig_transaction.to)
+        self.assertFalse(MultisigTransaction.objects.not_indexed_metadata_contract_addresses())
 
     def test_with_confirmations(self):
         multisig_transaction = MultisigTransactionFactory()

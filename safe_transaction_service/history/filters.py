@@ -1,21 +1,10 @@
 import django_filters
 from django_filters import rest_framework as filters
-from rest_framework.pagination import LimitOffsetPagination
 
 from gnosis.eth.django.filters import EthereumAddressFilter
 from gnosis.eth.django.models import EthereumAddressField, Uint256Field
 
 from .models import ModuleTransaction, MultisigTransaction
-
-
-class DefaultPagination(LimitOffsetPagination):
-    max_limit = 200
-    default_limit = 100
-
-
-class SmallPagination(LimitOffsetPagination):
-    max_limit = 100
-    default_limit = 20
 
 
 class TransferListFilter(filters.FilterSet):
@@ -110,7 +99,7 @@ class ModuleTransactionFilter(filters.FilterSet):
         }
 
 
-class MultisigTransactionAnalyticsFilter(filters.FilterSet):
+class AnalyticsMultisigTxsByOriginFilter(filters.FilterSet):
     class Meta:
         model = MultisigTransaction
         fields = {
@@ -135,3 +124,7 @@ class MultisigTransactionAnalyticsFilter(filters.FilterSet):
                 'filter_class': EthereumAddressFilter
             }
         }
+
+
+class AnalyticsMultisigTxsBySafeFilter(filters.FilterSet):
+    master_copy = django_filters.CharFilter()

@@ -5,8 +5,11 @@ from django.test import TestCase
 
 from eth_account import Account
 
-from ..tasks import BlockchainRunningTask, BlockchainRunningTaskManager
-from .factories import EthereumEventFactory, InternalTxFactory, WebHookFactory
+from ..models import SafeContract, SafeStatus
+from ..tasks import index_contract_metadata, process_decoded_internal_txs_task
+from .factories import (EthereumEventFactory, InternalTxDecodedFactory,
+                        InternalTxFactory, MultisigTransactionFactory,
+                        WebHookFactory)
 
 logger = logging.getLogger(__name__)
 
@@ -26,20 +29,27 @@ class TestTasks(TestCase):
         InternalTxFactory(to=to)
         self.assertEqual(mock_post.call_count, 2)
 
-    def test_blockchain_running_task(self):
-        # Test context manager
-        class A:
-            def __init__(self, id: str):
-                self.id = id
+    def test_process_decoded_internal_txs_task(self):
+        owner = Account.create().address
+        safe_address = Account.create().address
+        fallback_handler = Account.create().address
+        master_copy = Account.create().address
+        threshold = 1
+        InternalTxDecodedFactory(function_name='setup', owner=owner, threshold=threshold,
+                                 fallback_handler=fallback_handler,
+                                 internal_tx__to=master_copy,
+                                 internal_tx___from=safe_address)
+        process_decoded_internal_txs_task.delay()
+        self.assertTrue(SafeContract.objects.get(address=safe_address))
+        safe_status = SafeStatus.objects.get(address=safe_address)
+        self.assertEqual(safe_status.enabled_modules, [])
+        self.assertEqual(safe_status.fallback_handler, fallback_handler)
+        self.assertEqual(safe_status.master_copy, master_copy)
+        self.assertEqual(safe_status.owners, [owner])
+        self.assertEqual(safe_status.threshold, threshold)
 
-        BlockchainRunningTaskManager().delete_all_tasks()
-        a = A('custom-task-id')
-        b = A('another-task_id')
-        with BlockchainRunningTask(a) as blockchain_running_task:
-            self.assertEqual(blockchain_running_task.blockchain_running_task_manager.get_running_tasks(),
-                             [a.id])
-            with BlockchainRunningTask(b):
-                self.assertEqual(blockchain_running_task.blockchain_running_task_manager.get_running_tasks(),
-                                 [b.id, a.id])
-
-        self.assertEqual(BlockchainRunningTaskManager().get_running_tasks(), [])
+    def test_index_contract_metadata(self):
+        self.assertEqual(index_contract_metadata.delay().result, 0)
+        [MultisigTransactionFactory(to=Account.create().address, data=b'12') for _ in range(2)]
+        self.assertEqual(index_contract_metadata.delay().result, 2)
+        self.assertEqual(index_contract_metadata.delay().result, 0)

@@ -21,30 +21,10 @@ from web3 import Web3
 
 from safe_transaction_service.version import __version__
 
-from .filters import (DefaultPagination, ModuleTransactionFilter,
-                      MultisigTransactionAnalyticsFilter,
-                      MultisigTransactionFilter, SmallPagination,
-                      TransferListFilter)
+from . import filters, pagination, serializers
 from .models import (InternalTx, ModuleTransaction, MultisigConfirmation,
                      MultisigTransaction, SafeContract, SafeContractDelegate,
                      SafeMasterCopy, SafeStatus)
-from .serializers import (MasterCopyResponseSerializer,
-                          MultisigTransactionAnalyticsResponseSerializer,
-                          OwnerResponseSerializer,
-                          SafeBalanceResponseSerializer,
-                          SafeBalanceUsdResponseSerializer,
-                          SafeCollectibleResponseSerializer,
-                          SafeCreationInfoResponseSerializer,
-                          SafeDelegateDeleteSerializer,
-                          SafeDelegateResponseSerializer,
-                          SafeDelegateSerializer, SafeInfoResponseSerializer,
-                          SafeModuleTransactionResponseSerializer,
-                          SafeMultisigConfirmationResponseSerializer,
-                          SafeMultisigConfirmationSerializer,
-                          SafeMultisigTransactionResponseSerializer,
-                          SafeMultisigTransactionSerializer,
-                          TransferResponseSerializer,
-                          _AllTransactionsSchemaSerializer)
 from .services import (BalanceServiceProvider, SafeServiceProvider,
                        TransactionServiceProvider)
 from .services.collectibles_service import CollectiblesServiceProvider
@@ -79,21 +59,38 @@ class AboutView(APIView):
         return Response(content)
 
 
+class AnalyticsMultisigTxsByOriginListView(ListAPIView):
+    filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
+    filterset_class = filters.AnalyticsMultisigTxsByOriginFilter
+    pagination_class = None
+    queryset = MultisigTransaction.objects.values('origin').annotate(transactions=Count('*')).order_by('-transactions')
+    serializer_class = serializers.AnalyticsMultisigTxsByOriginResponseSerializer
+
+
+class AnalyticsMultisigTxsBySafeListView(ListAPIView):
+    filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
+    filterset_class = filters.AnalyticsMultisigTxsBySafeFilter
+    queryset = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
+    serializer_class = serializers.AnalyticsMultisigTxsBySafeResponseSerializer
+
+
 class AllTransactionsListView(ListAPIView):
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend, OrderingFilter)
-    pagination_class = SmallPagination
-    serializer_class = _AllTransactionsSchemaSerializer  # Just for docs, not used
+    pagination_class = pagination.SmallPagination
+    serializer_class = serializers._AllTransactionsSchemaSerializer  # Just for docs, not used
 
-    _schema_queued_param = openapi.Parameter('queued', openapi.IN_QUERY, type=openapi.TYPE_BOOLEAN, default=False,
+    _schema_queued_param = openapi.Parameter('executed', openapi.IN_QUERY, type=openapi.TYPE_BOOLEAN, default=False,
+                                             description='If `True` only executed transactions are returned')
+    _schema_queued_param = openapi.Parameter('queued', openapi.IN_QUERY, type=openapi.TYPE_BOOLEAN, default=True,
                                              description='If `True` transactions with `nonce >= Safe current nonce` '
-                                                         'are also shown')
+                                                         'are also returned')
     _schema_trusted_param = openapi.Parameter('trusted', openapi.IN_QUERY, type=openapi.TYPE_BOOLEAN, default=True,
                                               description='If `True` just trusted transactions are shown (indexed, '
                                                           'added by a delegate or with at least one confirmation)')
     _schema_200_response = openapi.Response('A list with every element with the structure of one of these transaction'
-                                            'types', _AllTransactionsSchemaSerializer)
+                                            'types', serializers._AllTransactionsSchemaSerializer)
 
-    def get_parameters(self) -> Tuple[bool, bool]:
+    def get_parameters(self) -> Tuple[bool, bool, bool]:
         """
         Parse query parameters:
         - queued: Default, True. If `queued=True` transactions with `nonce >= Safe current nonce` are also shown
@@ -101,15 +98,17 @@ class AllTransactionsListView(ListAPIView):
         or with at least one confirmation)
         :return: Tuple with queued, trusted
         """
+        executed = parse_boolean_query_param(self.request.query_params.get('executed', False))
         queued = parse_boolean_query_param(self.request.query_params.get('queued', True))
         trusted = parse_boolean_query_param(self.request.query_params.get('trusted', True))
-        return queued, trusted
+        return executed, queued, trusted
 
     def list(self, request, *args, **kwargs):
         transaction_service = TransactionServiceProvider()
         safe = self.kwargs['address']
-        queued, trusted = self.get_parameters()
-        queryset = self.filter_queryset(transaction_service.get_all_tx_hashes(safe, queued=queued, trusted=trusted))
+        executed, queued, trusted = self.get_parameters()
+        queryset = self.filter_queryset(transaction_service.get_all_tx_hashes(safe, executed=executed,
+                                                                              queued=queued, trusted=trusted))
         page = self.paginate_queryset(queryset)
 
         if not page:
@@ -147,10 +146,10 @@ class AllTransactionsListView(ListAPIView):
 
 class SafeModuleTransactionListView(ListAPIView):
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend, OrderingFilter)
-    filterset_class = ModuleTransactionFilter
+    filterset_class = filters.ModuleTransactionFilter
     ordering_fields = ['created']
-    pagination_class = DefaultPagination
-    serializer_class = SafeModuleTransactionResponseSerializer
+    pagination_class = pagination.DefaultPagination
+    serializer_class = serializers.SafeModuleTransactionResponseSerializer
 
     def get_queryset(self):
         return ModuleTransaction.objects.filter(
@@ -176,7 +175,7 @@ class SafeModuleTransactionListView(ListAPIView):
 
 
 class SafeMultisigConfirmationsView(ListCreateAPIView):
-    pagination_class = DefaultPagination
+    pagination_class = pagination.DefaultPagination
 
     def get_queryset(self):
         return MultisigConfirmation.objects.filter(multisig_transaction_id=self.kwargs['safe_tx_hash'])
@@ -188,9 +187,9 @@ class SafeMultisigConfirmationsView(ListCreateAPIView):
 
     def get_serializer_class(self):
         if self.request.method == 'GET':
-            return SafeMultisigConfirmationResponseSerializer
+            return serializers.SafeMultisigConfirmationResponseSerializer
         elif self.request.method == 'POST':
-            return SafeMultisigConfirmationSerializer
+            return serializers.SafeMultisigConfirmationSerializer
 
     @swagger_auto_schema(responses={400: 'Invalid data'})
     def get(self, request, *args, **kwargs):
@@ -213,7 +212,7 @@ class SafeMultisigConfirmationsView(ListCreateAPIView):
 @swagger_auto_schema(responses={200: 'Ok',
                                 404: 'Not found'})
 class SafeMultisigTransactionDetailView(RetrieveAPIView):
-    serializer_class = SafeMultisigTransactionResponseSerializer
+    serializer_class = serializers.SafeMultisigTransactionResponseSerializer
     lookup_field = 'safe_tx_hash'
     lookup_url_kwarg = 'safe_tx_hash'
 
@@ -228,9 +227,9 @@ class SafeMultisigTransactionDetailView(RetrieveAPIView):
 
 class SafeMultisigTransactionListView(ListAPIView):
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend, OrderingFilter)
-    filterset_class = MultisigTransactionFilter
+    filterset_class = filters.MultisigTransactionFilter
     ordering_fields = ['nonce', 'created']
-    pagination_class = DefaultPagination
+    pagination_class = pagination.DefaultPagination
 
     def get_queryset(self):
         return MultisigTransaction.objects.filter(
@@ -253,9 +252,9 @@ class SafeMultisigTransactionListView(ListAPIView):
         Proxy returning a serializer class according to the request's verb.
         """
         if self.request.method == 'GET':
-            return SafeMultisigTransactionResponseSerializer
+            return serializers.SafeMultisigTransactionResponseSerializer
         elif self.request.method == 'POST':
-            return SafeMultisigTransactionSerializer
+            return serializers.SafeMultisigTransactionSerializer
 
     @swagger_auto_schema(responses={400: 'Invalid data',
                                     422: 'Invalid ethereum address'})
@@ -293,14 +292,6 @@ class SafeMultisigTransactionListView(ListAPIView):
             return Response(status=status.HTTP_201_CREATED)
 
 
-class SafeMultisigTransactionAnalyticsListView(ListAPIView):
-    filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
-    filterset_class = MultisigTransactionAnalyticsFilter
-    pagination_class = None
-    queryset = MultisigTransaction.objects.values('origin').annotate(transactions=Count('*')).order_by('-transactions')
-    serializer_class = MultisigTransactionAnalyticsResponseSerializer
-
-
 def swagger_safe_balance_schema(serializer_class):
     _schema_token_trusted_param = openapi.Parameter('trusted', openapi.IN_QUERY, type=openapi.TYPE_BOOLEAN,
                                                     default=False,
@@ -316,7 +307,7 @@ def swagger_safe_balance_schema(serializer_class):
 
 
 class SafeBalanceView(APIView):
-    serializer_class = SafeBalanceResponseSerializer
+    serializer_class = serializers.SafeBalanceResponseSerializer
 
     def get_parameters(self) -> Tuple[bool, bool]:
         """
@@ -331,7 +322,7 @@ class SafeBalanceView(APIView):
         return BalanceServiceProvider().get_balances(*args, **kwargs)
 
     @swagger_safe_balance_schema(serializer_class)
-    @method_decorator(cache_page(15))
+    @method_decorator(cache_page(20))
     def get(self, request, address):
         """
         Get balance for Ether and ERC20 tokens
@@ -354,13 +345,13 @@ class SafeBalanceView(APIView):
 
 
 class SafeBalanceUsdView(SafeBalanceView):
-    serializer_class = SafeBalanceUsdResponseSerializer
+    serializer_class = serializers.SafeBalanceUsdResponseSerializer
 
     def get_result(self, *args, **kwargs):
         return BalanceServiceProvider().get_usd_balances(*args, **kwargs)
 
     @swagger_safe_balance_schema(serializer_class)
-    @method_decorator(cache_page(15))
+    @method_decorator(cache_page(20))
     def get(self, *args, **kwargs):
         """
         Get balance for Ether and ERC20 tokens with USD fiat conversion
@@ -369,7 +360,7 @@ class SafeBalanceUsdView(SafeBalanceView):
 
 
 class SafeCollectiblesView(SafeBalanceView):
-    serializer_class = SafeCollectibleResponseSerializer
+    serializer_class = serializers.SafeCollectibleResponseSerializer
 
     def get_result(self, *args, **kwargs):
         return CollectiblesServiceProvider().get_collectibles_with_metadata(*args, **kwargs)
@@ -384,7 +375,7 @@ class SafeCollectiblesView(SafeBalanceView):
 
 
 class SafeDelegateListView(ListCreateAPIView):
-    pagination_class = DefaultPagination
+    pagination_class = pagination.DefaultPagination
 
     def get_queryset(self):
         return SafeContractDelegate.objects.filter(
@@ -393,9 +384,9 @@ class SafeDelegateListView(ListCreateAPIView):
 
     def get_serializer_class(self):
         if self.request.method == 'GET':
-            return SafeDelegateResponseSerializer
+            return serializers.SafeDelegateResponseSerializer
         elif self.request.method == 'POST':
-            return SafeDelegateSerializer
+            return serializers.SafeDelegateSerializer
 
     @swagger_auto_schema(responses={400: 'Invalid data',
                                     422: 'Invalid Ethereum address'})
@@ -431,7 +422,7 @@ class SafeDelegateListView(ListCreateAPIView):
 
 
 class SafeDelegateDestroyView(DestroyAPIView):
-    serializer_class = SafeDelegateDeleteSerializer
+    serializer_class = serializers.SafeDelegateDeleteSerializer
 
     def get_object(self):
         return get_object_or_404(SafeContractDelegate,
@@ -459,9 +450,9 @@ class SafeDelegateDestroyView(DestroyAPIView):
 
 class SafeTransferListView(ListAPIView):
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
-    filterset_class = TransferListFilter
-    serializer_class = TransferResponseSerializer
-    pagination_class = DefaultPagination
+    filterset_class = filters.TransferListFilter
+    serializer_class = serializers.TransferResponseSerializer
+    pagination_class = pagination.DefaultPagination
 
     def list(self, request, *args, **kwargs):
         # Queryset must be already filtered, as we cannot filter a union
@@ -485,7 +476,7 @@ class SafeTransferListView(ListAPIView):
         address = self.kwargs['address']
         return self.get_transfers(address)
 
-    @swagger_auto_schema(responses={200: TransferResponseSerializer(many=True),
+    @swagger_auto_schema(responses={200: serializers.TransferResponseSerializer(many=True),
                                     422: 'Safe address checksum not valid'})
     def get(self, request, address, format=None):
         """
@@ -507,7 +498,7 @@ class SafeIncomingTransferListView(SafeTransferListView):
 
 
 class SafeCreationView(APIView):
-    serializer_class = SafeCreationInfoResponseSerializer
+    serializer_class = serializers.SafeCreationInfoResponseSerializer
 
     @swagger_auto_schema(responses={200: serializer_class(),
                                     404: 'Safe creation not found',
@@ -529,7 +520,7 @@ class SafeCreationView(APIView):
 
 
 class SafeInfoView(APIView):
-    serializer_class = SafeInfoResponseSerializer
+    serializer_class = serializers.SafeInfoResponseSerializer
 
     @swagger_auto_schema(responses={200: serializer_class(),
                                     404: 'Safe not found',
@@ -557,15 +548,15 @@ class SafeInfoView(APIView):
 
 
 class MasterCopiesView(ListAPIView):
-    serializer_class = MasterCopyResponseSerializer
+    serializer_class = serializers.MasterCopyResponseSerializer
     queryset = SafeMasterCopy.objects.all()
     pagination_class = None
 
 
 class OwnersView(APIView):
-    serializer_class = OwnerResponseSerializer
+    serializer_class = serializers.OwnerResponseSerializer
 
-    @swagger_auto_schema(responses={200: OwnerResponseSerializer(),
+    @swagger_auto_schema(responses={200: serializers.OwnerResponseSerializer(),
                                     422: 'Owner address checksum not valid'})
     def get(self, request, address, *args, **kwargs):
         """

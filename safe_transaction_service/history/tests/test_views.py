@@ -1,6 +1,7 @@
 import logging
 from dataclasses import asdict
 from unittest import mock
+from unittest.mock import MagicMock
 
 from django.urls import reverse
 
@@ -10,6 +11,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 from web3 import Web3
 
+from gnosis.eth.ethereum_client import ParityManager
 from gnosis.safe import Safe
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
@@ -30,6 +32,7 @@ from .factories import (EthereumEventFactory, EthereumTxFactory,
                         MultisigTransactionFactory,
                         SafeContractDelegateFactory, SafeContractFactory,
                         SafeMasterCopyFactory, SafeStatusFactory)
+from .mocks.traces import call_trace
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,63 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                                ]
         for transfer_not_empty, transaction in zip(transfers_not_empty, response.data['results']):
             self.assertEqual(bool(transaction['transfers']), transfer_not_empty)
+
+    def test_all_transactions_executed(self):
+        safe_address = Account.create().address
+
+        # No mined
+        MultisigTransactionFactory(safe=safe_address, ethereum_tx=None)
+        MultisigTransactionFactory(safe=safe_address, ethereum_tx=None)
+        # Mine tx with higher nonce, all should appear
+        MultisigTransactionFactory(safe=safe_address)
+
+        response = self.client.get(reverse('v1:all-transactions', args=(safe_address,))
+                                   + '?executed=False&queued=True&trusted=False')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 3)
+
+        response = self.client.get(reverse('v1:all-transactions', args=(safe_address,))
+                                   + '?executed=True&queued=True&trusted=False')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+
+    def test_all_transactions_wrong_transfer_type_view(self):
+        # No token in database, so we must trust the event
+        safe_address = Account.create().address
+        erc20_transfer_out = EthereumEventFactory(from_=safe_address)  # ERC20 event (with `value`)
+        response = self.client.get(reverse('v1:all-transactions', args=(safe_address,)) + '?queued=False&trusted=True')
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['transfers'][0]['type'], TransferType.ERC20_TRANSFER.name)
+        self.assertIsNone(response.data['results'][0]['transfers'][0]['token_id'])
+        self.assertIsNotNone(response.data['results'][0]['transfers'][0]['value'])
+
+        # Result should be the same, as we are adding an ERC20 token
+        token = TokenFactory(address=erc20_transfer_out.address, decimals=18)
+        response = self.client.get(reverse('v1:all-transactions', args=(safe_address,)) + '?queued=False&trusted=True')
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['transfers'][0]['type'], TransferType.ERC20_TRANSFER.name)
+        self.assertIsNone(response.data['results'][0]['transfers'][0]['token_id'])
+        self.assertIsNotNone(response.data['results'][0]['transfers'][0]['value'])
+
+        # Result should change if we set the token as an ERC721
+        token.decimals = None
+        token.save(update_fields=['decimals'])
+        response = self.client.get(reverse('v1:all-transactions', args=(safe_address,)) + '?queued=False&trusted=True')
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['transfers'][0]['type'], TransferType.ERC721_TRANSFER.name)
+        # TokenId and Value must be swapped now
+        self.assertIsNone(response.data['results'][0]['transfers'][0]['value'])
+        self.assertIsNotNone(response.data['results'][0]['transfers'][0]['token_id'])
+
+        # It should work with value=0
+        safe_address = Account.create().address
+        erc20_transfer_out = EthereumEventFactory(from_=safe_address, value=0)  # ERC20 event (with `value`)
+        token = TokenFactory(address=erc20_transfer_out.address, decimals=18)
+        response = self.client.get(reverse('v1:all-transactions', args=(safe_address,)) + '?queued=False&trusted=True')
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['transfers'][0]['type'], TransferType.ERC20_TRANSFER.name)
+        self.assertIsNone(response.data['results'][0]['transfers'][0]['token_id'])
+        self.assertEqual(response.data['results'][0]['transfers'][0]['value'], '0')
 
     def test_get_module_transactions(self):
         safe_address = Account.create().address
@@ -672,7 +732,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
     @mock.patch.object(BalanceService, 'get_token_info', autospec=True)
     @mock.patch.object(BalanceService, 'get_token_eth_value', return_value=0.4, autospec=True)
     @mock.patch.object(BalanceService, 'get_eth_price', return_value=123.4, autospec=True)
-    def test_safe_balances_usd_view(self, get_eth_price_mock, get_token_eth_value_mock, get_token_info_mock):
+    def test_safe_balances_usd_view(self, get_eth_price_mock: MagicMock, get_token_eth_value_mock: MagicMock,
+                                    get_token_info_mock: MagicMock):
         safe_address = Account.create().address
         response = self.client.get(reverse('v1:safe-balances-usd', args=(safe_address, )), format='json')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
@@ -1167,64 +1228,70 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.get(reverse('v1:safe-creation', args=(owner_address,)))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-        internal_tx = InternalTxFactory(contract_address=owner_address, trace_address='0,0', ethereum_tx__status=1)
-        response = self.client.get(reverse('v1:safe-creation', args=(owner_address,)), format='json')
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        created_iso = internal_tx.ethereum_tx.block.timestamp.isoformat().replace('+00:00', 'Z')
-        expected = {'created': created_iso,
-                    'creator': internal_tx._from,
-                    'factory_address': internal_tx._from,
-                    'master_copy': None,
-                    'setup_data': None,
-                    'data_decoded': None,
-                    'transaction_hash': internal_tx.ethereum_tx_id}
-        self.assertEqual(response.data, expected)
-
-        # Next internal_tx should not alter the result
-        next_internal_tx = InternalTxFactory(trace_address='0,0,0', ethereum_tx=internal_tx.ethereum_tx)
-        response = self.client.get(reverse('v1:safe-creation', args=(owner_address,)), format='json')
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, expected)
-
-        # Previous internal_tx should change the `creator` and `master_copy` and `setup_data` should appear
-        # Taken from rinkeby
-        create_test_data = {
-            'master_copy': '0xb6029EA3B2c51D09a50B53CA8012FeEB05bDa35A',
-            'setup_data': '0xa97ab18a00000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000006e45d69a383ceca3d54688e833bd0e1388747e6b00000000000000000000000061a0c717d18232711bc788f19c9cd56a43cc88720000000000000000000000007724b234c9099c205f03b458944942bceba134080000000000000000000000000000000000000000000000000000000000000000',
-            'data': '0x61b69abd000000000000000000000000b6029ea3b2c51d09a50b53ca8012feeb05bda35a00000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000184a97ab18a00000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000006e45d69a383ceca3d54688e833bd0e1388747e6b00000000000000000000000061a0c717d18232711bc788f19c9cd56a43cc88720000000000000000000000007724b234c9099c205f03b458944942bceba13408000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
-        }
-        data_decoded_1 = {'method': 'setup', 'parameters': [{'name': '_owners', 'type': 'address[]', 'value': ['0x6E45d69a383CECa3d54688e833Bd0e1388747e6B', '0x61a0c717d18232711bC788F19C9Cd56a43cc8872', '0x7724b234c9099C205F03b458944942bcEBA13408']}, {'name': '_threshold', 'type': 'uint256', 'value': '1'}, {'name': 'to', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'data', 'type': 'bytes', 'value': '0x'}, {'name': 'paymentToken', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'payment', 'type': 'uint256', 'value': '0'}, {'name': 'paymentReceiver', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}]}
-
-        create_test_data_2 = {
-            'master_copy': '0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F',
-            'setup_data': '0xb63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000180000000000000000000000000d5d82b6addc9027b22dca772aa68d5d74cdbdf440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ac9b6dd409ff10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000085c26101f353f38e45c72d414b44972831f07be3000000000000000000000000235518798770d7336c5c4908dd1019457fea43a10000000000000000000000007f63c25665ea7e85500eaeb806e552e651b07b9d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
-            'data': '0x1688f0b900000000000000000000000034cfac646f301356faa8b21e94227e3583fe3f5f0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000002cecc9e861200000000000000000000000000000000000000000000000000000000000001c4b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000180000000000000000000000000d5d82b6addc9027b22dca772aa68d5d74cdbdf440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ac9b6dd409ff10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000085c26101f353f38e45c72d414b44972831f07be3000000000000000000000000235518798770d7336c5c4908dd1019457fea43a10000000000000000000000007f63c25665ea7e85500eaeb806e552e651b07b9d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
-        }
-        data_decoded_2 = {'method': 'setup', 'parameters': [{'name': '_owners', 'type': 'address[]', 'value': ['0x85C26101f353f38E45c72d414b44972831f07BE3', '0x235518798770D7336c5c4908dd1019457FEa43a1', '0x7F63c25665EA7e85500eAEB806E552e651B07b9d']}, {'name': '_threshold', 'type': 'uint256', 'value': '1'}, {'name': 'to', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'data', 'type': 'bytes', 'value': '0x'}, {'name': 'fallbackHandler', 'type': 'address', 'value': '0xd5D82B6aDDc9027B22dCA772Aa68D5d74cdBdF44'}, {'name': 'paymentToken', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'payment', 'type': 'uint256', 'value': '3036537000337393'}, {'name': 'paymentReceiver', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}]}
-
-        create_cpk_test_data = {
-            'master_copy': '0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F',
-            'setup_data': '0x5714713d000000000000000000000000ff54516a7bc1c1ea952a688e72d5b93a80620074',
-            'data': '0x460868ca00000000000000000000000034cfac646f301356faa8b21e94227e3583fe3f5fcfe33a586323e7325be6aa6ecd8b4600d232a9037e83c8ece69413b777dabe6500000000000000000000000040a930851bd2e590bd5a5c981b436de25742e9800000000000000000000000005ef44de4b98f2bce0e29c344e7b2fb8f0282a0cf000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000245714713d000000000000000000000000ff54516a7bc1c1ea952a688e72d5b93a8062007400000000000000000000000000000000000000000000000000000000',
-        }
-        data_decoded_cpk = None
-
-        previous_internal_tx = InternalTxFactory(trace_address='0', ethereum_tx=internal_tx.ethereum_tx)
-        for test_data, data_decoded in [(create_test_data, data_decoded_1),
-                                        (create_test_data_2, data_decoded_2),
-                                        (create_cpk_test_data, data_decoded_cpk)]:
-            previous_internal_tx.data = HexBytes(test_data['data'])
-            previous_internal_tx.save(update_fields=['data'])
+        with mock.patch.object(ParityManager, 'trace_transaction', autospec=True, return_value=[]):
+            # Insert create contract internal tx
+            internal_tx = InternalTxFactory(contract_address=owner_address, trace_address='0,0', ethereum_tx__status=1)
             response = self.client.get(reverse('v1:safe-creation', args=(owner_address,)), format='json')
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             created_iso = internal_tx.ethereum_tx.block.timestamp.isoformat().replace('+00:00', 'Z')
-            self.assertEqual(response.data, {'created': created_iso,
-                                             'creator': previous_internal_tx._from,
-                                             'factory_address': internal_tx._from,
-                                             'master_copy': test_data['master_copy'],
-                                             'setup_data': test_data['setup_data'],
-                                             'data_decoded': data_decoded,
-                                             'transaction_hash': internal_tx.ethereum_tx_id})
+            expected = {'created': created_iso,
+                        'creator': internal_tx._from,
+                        'factory_address': internal_tx._from,
+                        'master_copy': None,
+                        'setup_data': None,
+                        'data_decoded': None,
+                        'transaction_hash': internal_tx.ethereum_tx_id}
+            self.assertEqual(response.data, expected)
+
+        # Next children internal_tx should not alter the result
+        another_trace = dict(call_trace)
+        another_trace['traceAddress'] = [0, 0, 0]
+        with mock.patch.object(ParityManager, 'trace_transaction', autospec=True, return_value=[another_trace]):
+            response = self.client.get(reverse('v1:safe-creation', args=(owner_address,)), format='json')
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data, expected)
+
+        another_trace_2 = dict(call_trace)
+        another_trace_2['traceAddress'] = [0]
+        with mock.patch.object(ParityManager, 'trace_transaction', autospec=True, return_value=[another_trace,
+                                                                                                another_trace_2]):
+            # `another_trace_2` should change the `creator` and `master_copy` and `setup_data` should appear
+            # Taken from rinkeby
+            create_test_data = {
+                'master_copy': '0xb6029EA3B2c51D09a50B53CA8012FeEB05bDa35A',
+                'setup_data': '0xa97ab18a00000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000006e45d69a383ceca3d54688e833bd0e1388747e6b00000000000000000000000061a0c717d18232711bc788f19c9cd56a43cc88720000000000000000000000007724b234c9099c205f03b458944942bceba134080000000000000000000000000000000000000000000000000000000000000000',
+                'data': '0x61b69abd000000000000000000000000b6029ea3b2c51d09a50b53ca8012feeb05bda35a00000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000184a97ab18a00000000000000000000000000000000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000006e45d69a383ceca3d54688e833bd0e1388747e6b00000000000000000000000061a0c717d18232711bc788f19c9cd56a43cc88720000000000000000000000007724b234c9099c205f03b458944942bceba13408000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
+            }
+            data_decoded_1 = {'method': 'setup', 'parameters': [{'name': '_owners', 'type': 'address[]', 'value': ['0x6E45d69a383CECa3d54688e833Bd0e1388747e6B', '0x61a0c717d18232711bC788F19C9Cd56a43cc8872', '0x7724b234c9099C205F03b458944942bcEBA13408']}, {'name': '_threshold', 'type': 'uint256', 'value': '1'}, {'name': 'to', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'data', 'type': 'bytes', 'value': '0x'}, {'name': 'paymentToken', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'payment', 'type': 'uint256', 'value': '0'}, {'name': 'paymentReceiver', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}]}
+
+            create_test_data_2 = {
+                'master_copy': '0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F',
+                'setup_data': '0xb63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000180000000000000000000000000d5d82b6addc9027b22dca772aa68d5d74cdbdf440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ac9b6dd409ff10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000085c26101f353f38e45c72d414b44972831f07be3000000000000000000000000235518798770d7336c5c4908dd1019457fea43a10000000000000000000000007f63c25665ea7e85500eaeb806e552e651b07b9d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
+                'data': '0x1688f0b900000000000000000000000034cfac646f301356faa8b21e94227e3583fe3f5f0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000002cecc9e861200000000000000000000000000000000000000000000000000000000000001c4b63e800d0000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000180000000000000000000000000d5d82b6addc9027b22dca772aa68d5d74cdbdf440000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ac9b6dd409ff10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000085c26101f353f38e45c72d414b44972831f07be3000000000000000000000000235518798770d7336c5c4908dd1019457fea43a10000000000000000000000007f63c25665ea7e85500eaeb806e552e651b07b9d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
+            }
+            data_decoded_2 = {'method': 'setup', 'parameters': [{'name': '_owners', 'type': 'address[]', 'value': ['0x85C26101f353f38E45c72d414b44972831f07BE3', '0x235518798770D7336c5c4908dd1019457FEa43a1', '0x7F63c25665EA7e85500eAEB806E552e651B07b9d']}, {'name': '_threshold', 'type': 'uint256', 'value': '1'}, {'name': 'to', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'data', 'type': 'bytes', 'value': '0x'}, {'name': 'fallbackHandler', 'type': 'address', 'value': '0xd5D82B6aDDc9027B22dCA772Aa68D5d74cdBdF44'}, {'name': 'paymentToken', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}, {'name': 'payment', 'type': 'uint256', 'value': '3036537000337393'}, {'name': 'paymentReceiver', 'type': 'address', 'value': '0x0000000000000000000000000000000000000000'}]}
+
+            create_cpk_test_data = {
+                'master_copy': '0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F',
+                'setup_data': '0x5714713d000000000000000000000000ff54516a7bc1c1ea952a688e72d5b93a80620074',
+                'data': '0x460868ca00000000000000000000000034cfac646f301356faa8b21e94227e3583fe3f5fcfe33a586323e7325be6aa6ecd8b4600d232a9037e83c8ece69413b777dabe6500000000000000000000000040a930851bd2e590bd5a5c981b436de25742e9800000000000000000000000005ef44de4b98f2bce0e29c344e7b2fb8f0282a0cf000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000245714713d000000000000000000000000ff54516a7bc1c1ea952a688e72d5b93a8062007400000000000000000000000000000000000000000000000000000000',
+            }
+            data_decoded_cpk = None
+
+            for test_data, data_decoded in [(create_test_data, data_decoded_1),
+                                            (create_test_data_2, data_decoded_2),
+                                            (create_cpk_test_data, data_decoded_cpk)]:
+                another_trace_2['action']['input'] = HexBytes(test_data['data'])
+                response = self.client.get(reverse('v1:safe-creation', args=(owner_address,)), format='json')
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                created_iso = internal_tx.ethereum_tx.block.timestamp.isoformat().replace('+00:00', 'Z')
+                self.assertEqual(response.data, {'created': created_iso,
+                                                 'creator': another_trace_2['action']['from'],
+                                                 'factory_address': internal_tx._from,
+                                                 'master_copy': test_data['master_copy'],
+                                                 'setup_data': test_data['setup_data'],
+                                                 'data_decoded': data_decoded,
+                                                 'transaction_hash': internal_tx.ethereum_tx_id})
 
     def test_safe_info_view(self):
         invalid_address = '0x2A'
@@ -1267,14 +1334,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         expected += [{'address': safe_master_copy.address, 'version': safe_master_copy.version}]
         self.assertCountEqual(response.data, expected)
 
-    def test_multisig_transactions_analytics_view(self):
-        response = self.client.get(reverse('v1:multisig-transactions-analytics'))
+    def test_analytics_multisig_txs_by_origin_view(self):
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-origin'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         origin = 'Millennium Falcon Navigation Computer'
         origin_2 = 'HAL 9000'
         multisig_transaction = MultisigTransactionFactory(origin=origin)
-        response = self.client.get(reverse('v1:multisig-transactions-analytics'))
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-origin'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected = [
             {'origin': origin, 'transactions': 1},
@@ -1284,7 +1351,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         for _ in range(3):
             MultisigTransactionFactory(origin=origin_2)
 
-        response = self.client.get(reverse('v1:multisig-transactions-analytics'))
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-origin'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected = [
             {'origin': origin_2, 'transactions': 3},
@@ -1296,7 +1363,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             MultisigTransactionFactory(origin=origin)
 
         # Check sorting by the biggest
-        response = self.client.get(reverse('v1:multisig-transactions-analytics'))
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-origin'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected = [
             {'origin': origin, 'transactions': 4},
@@ -1308,19 +1375,70 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         origin_3 = 'Skynet'
         safe_address = Account.create().address
         MultisigTransactionFactory(origin=origin_3, safe=safe_address)
-        response = self.client.get(reverse('v1:multisig-transactions-analytics') + f'?safe={safe_address}')
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-origin') + f'?safe={safe_address}')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected = [
             {'origin': origin_3, 'transactions': 1},
         ]
         self.assertEqual(response.data, expected)
 
-        response = self.client.get(reverse('v1:multisig-transactions-analytics') + f'?to={multisig_transaction.to}')
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-origin') + f'?to={multisig_transaction.to}')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected = [
             {'origin': multisig_transaction.origin, 'transactions': 1},
         ]
         self.assertEqual(response.data, expected)
+
+    def test_analytics_multisig_txs_by_safe_view(self):
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-safe'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        safe_address_1 = Account.create().address
+        safe_address_2 = Account.create().address
+        safe_address_3 = Account.create().address
+        MultisigTransactionFactory(safe=safe_address_1)
+        MultisigTransactionFactory(safe=safe_address_1)
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-safe'))
+        result = response.json()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['results'][0], {'safe': safe_address_1, 'masterCopy': None, 'transactions': 2})
+        MultisigTransactionFactory(safe=safe_address_1)
+        safe_status_1 = SafeStatusFactory(address=safe_address_1)
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-safe'))
+        result = response.json()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(result['count'], 1)
+        self.assertIsNotNone(safe_status_1.master_copy)
+        self.assertEqual(result['results'][0], {'safe': safe_address_1,
+                                                'masterCopy': safe_status_1.master_copy,
+                                                'transactions': 3})
+        MultisigTransactionFactory(safe=safe_address_2)
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-safe'))
+        result = response.json()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(result['results'], [
+            {'safe': safe_address_1, 'masterCopy': safe_status_1.master_copy, 'transactions': 3},
+            {'safe': safe_address_2, 'masterCopy': None, 'transactions': 1}
+        ])
+        safe_status_2 = SafeStatusFactory(address=safe_address_2)
+        safe_status_3 = SafeStatusFactory(address=safe_address_3)
+        [MultisigTransactionFactory(safe=safe_address_3) for _ in range(4)]
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-safe'))
+        result = response.json()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(result['results'], [
+            {'safe': safe_address_3, 'masterCopy': safe_status_3.master_copy, 'transactions': 4},
+            {'safe': safe_address_1, 'masterCopy': safe_status_1.master_copy, 'transactions': 3},
+            {'safe': safe_address_2, 'masterCopy': safe_status_2.master_copy, 'transactions': 1}
+        ])
+
+        response = self.client.get(reverse('v1:analytics-multisig-txs-by-safe')
+                                   + f'?master_copy={safe_status_1.master_copy}')
+        result = response.json()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(result['results'], [
+            {'safe': safe_address_1, 'masterCopy': safe_status_1.master_copy, 'transactions': 3},
+        ])
 
     def test_owners_view(self):
         invalid_address = '0x2A'
